@@ -25,7 +25,7 @@ export default function QrStandeePanel({
   const [copied, setCopied] = useState(false);
   const [downloading, setDownloading] = useState(false);
 
-  const shareUrl = buildShopShareUrl(shop.slug);
+  const shareUrl = buildShopShareUrl(shop.slug, shop);
 
   useEffect(() => {
     let active = true;

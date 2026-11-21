@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
-import { ArrowLeft, ExternalLink, Plus, Smartphone } from 'lucide-react';
+import { ExternalLink, Plus, Smartphone, X } from 'lucide-react';
 import CustomerPage from './components/CustomerPage';
 import FeedbackInbox from './components/FeedbackInbox';
 import QrStandeePanel from './components/QrStandeePanel';
@@ -14,9 +14,13 @@ import {
 } from './types';
 import {
   cleanIndianPhone,
+  decodeShopPayload,
   normalizeSafeUrl,
+  readLocalFeedback,
   readLocalShops,
   slugifyShopName,
+  STATIC_SEED_SHOPS,
+  writeLocalFeedback,
   writeLocalShops,
 } from './utils/shopUtils';
 
@@ -32,18 +36,75 @@ const EMPTY_FORM: ShopFormInput = {
   greeting: DEFAULT_GREETING,
 };
 
-function getShopSlugFromUrl(): string | null {
-  if (typeof window === 'undefined') return null;
+interface RouteInfo {
+  slug: string | null;
+  encodedPayload: string | null;
+}
+
+/**
+ * Supports GitHub Pages subpath hosting (/JBPgrow/) with both query (?shop=slug)
+ * and hash (#/shop/slug or #shop=slug) routing. Any unrecognized route falls back to Home.
+ */
+function parseRouteFromLocation(): RouteInfo {
+  if (typeof window === 'undefined') return { slug: null, encodedPayload: null };
+
   const params = new URLSearchParams(window.location.search);
-  const slug = params.get('shop');
-  return slug ? slug.trim().toLowerCase() : null;
+  const querySlug = params.get('shop')?.trim().toLowerCase() || null;
+  const queryPayload = params.get('d')?.trim() || null;
+  if (querySlug) {
+    return { slug: querySlug, encodedPayload: queryPayload };
+  }
+
+  const hash = window.location.hash.replace(/^#\/?/, '').trim();
+  if (hash) {
+    if (hash.startsWith('shop/')) {
+      const rest = hash.slice(5);
+      const [slugPart, hashQuery] = rest.split('?');
+      const hParams = new URLSearchParams(hashQuery || '');
+      const cleanSlug = slugPart.trim().toLowerCase();
+      if (cleanSlug) {
+        return { slug: cleanSlug, encodedPayload: hParams.get('d') };
+      }
+    } else if (hash.includes('shop=')) {
+      const hParams = new URLSearchParams(hash);
+      const cleanSlug = hParams.get('shop')?.trim().toLowerCase() || null;
+      if (cleanSlug) {
+        return { slug: cleanSlug, encodedPayload: hParams.get('d') };
+      }
+    }
+  }
+
+  return { slug: null, encodedPayload: null };
+}
+
+function isJsonResponse(res: Response): boolean {
+  const ct = res.headers.get('content-type') || '';
+  return ct.includes('application/json');
+}
+
+function applyLocalStatIncrement(
+  shops: ShopRecord[],
+  slug: string,
+  type: ShopEventType
+): ShopRecord[] {
+  return shops.map((s) => {
+    if (s.slug !== slug) return s;
+    const stats = { ...s.stats };
+    if (type === 'tap') stats.taps += 1;
+    if (type === 'good') stats.good += 1;
+    if (type === 'bad') stats.bad += 1;
+    if (type === 'whatsapp') stats.whatsappClicks += 1;
+    if (type === 'insta') stats.instaClicks += 1;
+    if (type === 'call') stats.callClicks += 1;
+    return { ...s, stats };
+  });
 }
 
 export default function App() {
-  const [routeSlug, setRouteSlug] = useState<string | null>(() => getShopSlugFromUrl());
+  const [route, setRoute] = useState<RouteInfo>(() => parseRouteFromLocation());
   const [customerShop, setCustomerShop] = useState<ShopRecord | null>(null);
-  const [customerLoading, setCustomerLoading] = useState<boolean>(Boolean(routeSlug));
-  const [customerNotFound, setCustomerNotFound] = useState<boolean>(false);
+  const [customerLoading, setCustomerLoading] = useState<boolean>(Boolean(route.slug));
+  const [routeFallbackNotice, setRouteFallbackNotice] = useState<string | null>(null);
   const [cameFromAdmin, setCameFromAdmin] = useState<boolean>(false);
 
   // Admin state
@@ -62,21 +123,25 @@ export default function App() {
 
   const trackedTapRef = useRef<string | null>(null);
 
-  // Listen to browser back/forward navigation
+  // Listen to browser back/forward & hash changes
   useEffect(() => {
-    const onPopState = () => {
-      setRouteSlug(getShopSlugFromUrl());
+    const syncRoute = () => {
+      setRoute(parseRouteFromLocation());
     };
-    window.addEventListener('popstate', onPopState);
-    return () => window.removeEventListener('popstate', onPopState);
+    window.addEventListener('popstate', syncRoute);
+    window.addEventListener('hashchange', syncRoute);
+    return () => {
+      window.removeEventListener('popstate', syncRoute);
+      window.removeEventListener('hashchange', syncRoute);
+    };
   }, []);
 
-  // Load all shops for Admin workspace
+  // Load all shops for Admin workspace (works with Express API OR statically on GitHub Pages)
   const fetchAllShops = useCallback(async () => {
     setLoadingShops(true);
     try {
-      const res = await fetch('/api/shops');
-      if (!res.ok) throw new Error('API error');
+      const res = await fetch('./api/shops');
+      if (!res.ok || !isJsonResponse(res)) throw new Error('Static host mode');
       const data = (await res.json()) as {
         shops: ShopRecord[];
         feedback: PrivateFeedback[];
@@ -84,48 +149,52 @@ export default function App() {
       setShops(data.shops);
       setFeedback(data.feedback || []);
       writeLocalShops(data.shops);
+      writeLocalFeedback(data.feedback || []);
       setSelectedSlug((prev) => prev || data.shops[0]?.slug || null);
     } catch {
       const local = readLocalShops();
-      setShops(local);
-      setSelectedSlug((prev) => prev || local[0]?.slug || null);
+      const initialShops = local.length > 0 ? local : STATIC_SEED_SHOPS;
+      if (local.length === 0) {
+        writeLocalShops(initialShops);
+      }
+      setShops(initialShops);
+      setFeedback(readLocalFeedback());
+      setSelectedSlug((prev) => prev || initialShops[0]?.slug || null);
     } finally {
       setLoadingShops(false);
     }
   }, []);
 
   useEffect(() => {
-    if (!routeSlug) {
+    if (!route.slug) {
       fetchAllShops();
     }
-  }, [routeSlug, fetchAllShops]);
+  }, [route.slug, fetchAllShops]);
 
-  // Load single shop when opened in Customer NFC/QR mode (?shop=slug)
+  // Load single shop when opened in Customer NFC/QR mode (?shop=slug or #/shop/slug)
   useEffect(() => {
-    if (!routeSlug) {
+    if (!route.slug) {
       setCustomerShop(null);
-      setCustomerNotFound(false);
       setCustomerLoading(false);
       return;
     }
 
     let cancelled = false;
     setCustomerLoading(true);
-    setCustomerNotFound(false);
 
-    async function loadShop(slug: string) {
+    async function loadShop(slug: string, encodedPayload: string | null) {
+      // 1. Try backend API when hosted on Node/Express
       try {
-        const res = await fetch(`/api/shops/${encodeURIComponent(slug)}`);
-        if (res.ok) {
+        const res = await fetch(`./api/shops/${encodeURIComponent(slug)}`);
+        if (res.ok && isJsonResponse(res)) {
           const data = (await res.json()) as { shop: ShopRecord };
           if (!cancelled) {
             setCustomerShop(data.shop);
             setCustomerLoading(false);
           }
-          // Record tap once per slug load
           if (trackedTapRef.current !== slug) {
             trackedTapRef.current = slug;
-            fetch(`/api/shops/${encodeURIComponent(slug)}/events`, {
+            fetch(`./api/shops/${encodeURIComponent(slug)}/events`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ type: 'tap' }),
@@ -134,68 +203,139 @@ export default function App() {
           return;
         }
       } catch {
-        // Fall back to localStorage below
+        // Static GitHub Pages fallback below
       }
 
-      const localMatch = readLocalShops().find((s) => s.slug === slug);
+      // 2. Check encoded URL payload (?d=...) for cross-device static links
+      if (encodedPayload) {
+        const decoded = decodeShopPayload(slug, encodedPayload);
+        if (decoded && !cancelled) {
+          setCustomerShop(decoded);
+          setCustomerLoading(false);
+          return;
+        }
+      }
+
+      // 3. Check localStorage and static starter shops
+      const localList = readLocalShops();
+      const match =
+        localList.find((s) => s.slug === slug) ||
+        STATIC_SEED_SHOPS.find((s) => s.slug === slug);
+
       if (!cancelled) {
-        if (localMatch) {
-          setCustomerShop(localMatch);
+        if (match) {
+          setCustomerShop(match);
+          if (trackedTapRef.current !== slug) {
+            trackedTapRef.current = slug;
+            const updated = applyLocalStatIncrement(
+              localList.length > 0 ? localList : STATIC_SEED_SHOPS,
+              slug,
+              'tap'
+            );
+            writeLocalShops(updated);
+          }
         } else {
+          // Fallback directly to Home page instead of showing a blank or 404 screen
           setCustomerShop(null);
-          setCustomerNotFound(true);
+          setRouteFallbackNotice(
+            `"${slug}" naam ki dukaan nahi mili — isliye Home page dikhaya ja raha hai.`
+          );
+          const cleanUrl = new URL(window.location.href);
+          cleanUrl.searchParams.delete('shop');
+          cleanUrl.searchParams.delete('d');
+          cleanUrl.hash = '';
+          window.history.replaceState({}, '', cleanUrl.toString());
+          setRoute({ slug: null, encodedPayload: null });
         }
         setCustomerLoading(false);
       }
     }
 
-    loadShop(routeSlug);
+    loadShop(route.slug, route.encodedPayload);
     return () => {
       cancelled = true;
     };
-  }, [routeSlug]);
+  }, [route.slug, route.encodedPayload]);
 
   const navigateToCustomer = (slug: string) => {
+    const targetShop = shops.find((s) => s.slug === slug);
     const url = new URL(window.location.href);
+    url.hash = '';
     url.searchParams.set('shop', slug);
+    url.searchParams.delete('d');
     window.history.pushState({}, '', url.toString());
     trackedTapRef.current = null;
     setCameFromAdmin(true);
-    setRouteSlug(slug);
+    setRouteFallbackNotice(null);
+    if (targetShop) {
+      setCustomerShop(targetShop);
+    }
+    setRoute({ slug, encodedPayload: null });
   };
 
   const navigateBackToAdmin = () => {
     const url = new URL(window.location.href);
     url.searchParams.delete('shop');
+    url.searchParams.delete('d');
+    url.hash = '';
     window.history.pushState({}, '', url.toString());
-    setRouteSlug(null);
+    setRoute({ slug: null, encodedPayload: null });
   };
 
   const trackShopEvent = useCallback(
     async (slug: string, type: ShopEventType, message?: string) => {
       try {
-        const res = await fetch(`/api/shops/${encodeURIComponent(slug)}/events`, {
+        const res = await fetch(`./api/shops/${encodeURIComponent(slug)}/events`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ type, message }),
         });
-        if (res.ok) {
+        if (res.ok && isJsonResponse(res)) {
           const data = (await res.json()) as {
             shop: ShopRecord;
             feedback: PrivateFeedback | null;
           };
-          setShops((prev) =>
-            prev.map((s) => (s.slug === data.shop.slug ? data.shop : s))
-          );
+          setShops((prev) => {
+            const next = prev.map((s) => (s.slug === data.shop.slug ? data.shop : s));
+            writeLocalShops(next);
+            return next;
+          });
           if (data.feedback) {
-            setFeedback((prev) => [data.feedback!, ...prev]);
+            setFeedback((prev) => {
+              const next = [data.feedback!, ...prev];
+              writeLocalFeedback(next);
+              return next;
+            });
           }
+          return;
         }
       } catch {
-        // Non-blocking analytics failure
+        // Static mode fallback below
+      }
+
+      // Persist stats and private feedback locally when running statically on GitHub Pages
+      setShops((prev) => {
+        const next = applyLocalStatIncrement(prev, slug, type);
+        writeLocalShops(next);
+        return next;
+      });
+      if (type === 'bad' && message && message.trim()) {
+        const shopMatch = shops.find((s) => s.slug === slug) || customerShop;
+        const entry: PrivateFeedback = {
+          id: `fb-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          shopSlug: slug,
+          shopName: shopMatch?.name || slug,
+          message: message.trim().slice(0, 400),
+          createdAt: new Date().toISOString(),
+        };
+        setFeedback((prev) => {
+          const next = [entry, ...prev];
+          writeLocalFeedback(next);
+          return next;
+        });
       }
     },
-    []
+    [shops, customerShop]
   );
 
   // Handle Create / Update Shop form submit
@@ -238,8 +378,8 @@ export default function App() {
     setSubmitting(true);
     try {
       const endpoint = editingSlug
-        ? `/api/shops/${encodeURIComponent(editingSlug)}`
-        : '/api/shops';
+        ? `./api/shops/${encodeURIComponent(editingSlug)}`
+        : './api/shops';
       const method = editingSlug ? 'PUT' : 'POST';
 
       const res = await fetch(endpoint, {
@@ -247,6 +387,10 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
+
+      if (!isJsonResponse(res)) {
+        throw new Error('Static host mode');
+      }
 
       const data = (await res.json()) as { shop?: ShopRecord; error?: string };
       if (!res.ok || !data.shop) {
@@ -267,13 +411,31 @@ export default function App() {
       setEditingSlug(null);
       setFormValues(EMPTY_FORM);
     } catch {
-      // Offline localStorage fallback if server temporarily unreachable
-      const fallbackSlug = editingSlug || slugifyShopName(payload.name);
+      // Static GitHub Pages localStorage persistence
+      const existingShop = editingSlug
+        ? shops.find((s) => s.slug === editingSlug)
+        : null;
+      let slug = editingSlug || slugifyShopName(payload.name);
+      if (!editingSlug && shops.some((s) => s.slug === slug)) {
+        let suffix = 2;
+        while (shops.some((s) => s.slug === `${slug}-${suffix}`)) {
+          suffix += 1;
+        }
+        slug = `${slug}-${suffix}`;
+      }
+
       const localShop: ShopRecord = {
-        slug: fallbackSlug,
+        slug,
         ...payload,
-        createdAt: new Date().toISOString(),
-        stats: { taps: 0, good: 0, bad: 0, whatsappClicks: 0, instaClicks: 0, callClicks: 0 },
+        createdAt: existingShop?.createdAt || new Date().toISOString(),
+        stats: existingShop?.stats || {
+          taps: 0,
+          good: 0,
+          bad: 0,
+          whatsappClicks: 0,
+          instaClicks: 0,
+          callClicks: 0,
+        },
       };
       setShops((prev) => {
         const next = editingSlug
@@ -310,9 +472,9 @@ export default function App() {
 
   const handleDeleteShop = async (slug: string) => {
     try {
-      await fetch(`/api/shops/${encodeURIComponent(slug)}`, { method: 'DELETE' });
+      await fetch(`./api/shops/${encodeURIComponent(slug)}`, { method: 'DELETE' });
     } catch {
-      // Continue local removal
+      // Continue local removal in static mode
     }
     setShops((prev) => {
       const next = prev.filter((s) => s.slug !== slug);
@@ -322,7 +484,11 @@ export default function App() {
       }
       return next;
     });
-    setFeedback((prev) => prev.filter((f) => f.shopSlug !== slug));
+    setFeedback((prev) => {
+      const next = prev.filter((f) => f.shopSlug !== slug);
+      writeLocalFeedback(next);
+      return next;
+    });
     if (justCreatedShop?.slug === slug) {
       setJustCreatedShop(null);
     }
@@ -384,9 +550,9 @@ export default function App() {
   }, [shops]);
 
   // ---------------------------------------------------------------------------
-  // STANDALONE CUSTOMER ROUTE (?shop=slug)
+  // STANDALONE CUSTOMER ROUTE (?shop=slug or #/shop/slug)
   // ---------------------------------------------------------------------------
-  if (routeSlug) {
+  if (route.slug) {
     if (customerLoading) {
       return (
         <div className="min-h-screen bg-[#F8FAFC] flex flex-col items-center justify-center p-6">
@@ -403,44 +569,20 @@ export default function App() {
       );
     }
 
-    if (customerNotFound || !customerShop) {
+    if (customerShop) {
       return (
-        <div className="min-h-screen bg-[#F8FAFC] flex flex-col items-center justify-center px-4 py-10">
-          <div className="w-full max-w-md rounded-3xl border border-slate-200 bg-white p-8 text-center">
-            <div className="font-display text-2xl font-extrabold tracking-tight text-slate-900">
-              Grow<span className="text-emerald-600">JBP</span>
-            </div>
-            <h1 className="mt-4 font-display text-lg font-bold text-slate-900">
-              Ye dukaan link active nahi hai
-            </h1>
-            <p className="mt-2 text-sm text-slate-500">
-              Ho sakta hai link galat ho ya dukaan abhi register na hui ho.
-            </p>
-            <button
-              type="button"
-              onClick={navigateBackToAdmin}
-              className="mt-6 inline-flex min-h-[44px] items-center gap-2 rounded-xl bg-slate-900 px-5 py-2.5 text-sm font-semibold text-white hover:bg-slate-800 transition-colors"
-            >
-              <ArrowLeft className="h-4 w-4" aria-hidden="true" />
-              <span>GrowJBP Panel Par Jayein</span>
-            </button>
-          </div>
-        </div>
+        <CustomerPage
+          shop={customerShop}
+          mode="standalone"
+          onTrackEvent={(type, msg) => trackShopEvent(customerShop.slug, type, msg)}
+          onBackToAdmin={cameFromAdmin ? navigateBackToAdmin : undefined}
+        />
       );
     }
-
-    return (
-      <CustomerPage
-        shop={customerShop}
-        mode="standalone"
-        onTrackEvent={(type, msg) => trackShopEvent(customerShop.slug, type, msg)}
-        onBackToAdmin={cameFromAdmin ? navigateBackToAdmin : undefined}
-      />
-    );
   }
 
   // ---------------------------------------------------------------------------
-  // ADMIN PANEL WORKSPACE
+  // ADMIN PANEL / HOME PAGE WORKSPACE (Default fallback for all unknown routes)
   // ---------------------------------------------------------------------------
   return (
     <div className="min-h-screen bg-[#F8FAFC] text-slate-900 flex flex-col">
@@ -536,6 +678,20 @@ export default function App() {
 
       {/* Main Content */}
       <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-8 sm:px-6 lg:px-8">
+        {routeFallbackNotice && (
+          <div className="mb-6 flex items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950 no-print">
+            <span>{routeFallbackNotice}</span>
+            <button
+              type="button"
+              onClick={() => setRouteFallbackNotice(null)}
+              aria-label="Notice band karein"
+              className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-amber-800 hover:bg-amber-100 shrink-0"
+            >
+              <X className="h-4 w-4" aria-hidden="true" />
+            </button>
+          </div>
+        )}
+
         {/* Page Heading + KPI Strip */}
         <section className="no-print">
           <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">

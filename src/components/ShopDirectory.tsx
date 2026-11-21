@@ -56,8 +56,8 @@ export default function ShopDirectory({
     return matchesArea && matchesQuery;
   });
 
-  const handleCopy = async (slug: string) => {
-    const url = buildShopShareUrl(slug);
+  const handleCopy = async (shop: ShopRecord) => {
+    const url = buildShopShareUrl(shop.slug, shop);
     try {
       await navigator.clipboard.writeText(url);
     } catch {
@@ -68,9 +68,9 @@ export default function ShopDirectory({
       document.execCommand('copy');
       document.body.removeChild(input);
     }
-    setCopiedSlug(slug);
+    setCopiedSlug(shop.slug);
     window.setTimeout(() => {
-      setCopiedSlug((prev) => (prev === slug ? null : prev));
+      setCopiedSlug((prev) => (prev === shop.slug ? null : prev));
     }, 2000);
   };
 
@@ -236,7 +236,7 @@ export default function ShopDirectory({
                   >
                     <button
                       type="button"
-                      onClick={() => handleCopy(shop.slug)}
+                      onClick={() => handleCopy(shop)}
                       className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 transition-colors whitespace-nowrap"
                     >
                       {copiedSlug === shop.slug ? (

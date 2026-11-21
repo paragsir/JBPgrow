@@ -37,7 +37,9 @@ export default function ShopForm({
 }: ShopFormProps) {
   const [copiedNew, setCopiedNew] = useState(false);
 
-  const createdUrl = justCreatedShop ? buildShopShareUrl(justCreatedShop.slug) : '';
+  const createdUrl = justCreatedShop
+    ? buildShopShareUrl(justCreatedShop.slug, justCreatedShop)
+    : '';
 
   const handleCopyCreated = async () => {
     if (!createdUrl) return;
