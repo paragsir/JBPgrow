@@ -1,0 +1,6 @@
+{
+  "name": "GrowJBP",
+  "description": "Jabalpur ke local businesses ke liye NFC card, QR code aur smart Google Review growth platform.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
