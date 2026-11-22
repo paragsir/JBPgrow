@@ -82,6 +82,14 @@ function isJsonResponse(res: Response): boolean {
   return ct.includes('application/json');
 }
 
+function isStaticPagesHost(): boolean {
+  if (typeof window === 'undefined') return false;
+  return (
+    window.location.hostname.endsWith('github.io') ||
+    window.location.protocol === 'file:'
+  );
+}
+
 function applyLocalStatIncrement(
   shops: ShopRecord[],
   slug: string,
@@ -138,6 +146,19 @@ export default function App() {
 
   // Load all shops for Admin workspace (works with Express API OR statically on GitHub Pages)
   const fetchAllShops = useCallback(async () => {
+    if (isStaticPagesHost()) {
+      const local = readLocalShops();
+      const initialShops = local.length > 0 ? local : STATIC_SEED_SHOPS;
+      if (local.length === 0) {
+        writeLocalShops(initialShops);
+      }
+      setShops(initialShops);
+      setFeedback(readLocalFeedback());
+      setSelectedSlug((prev) => prev || initialShops[0]?.slug || null);
+      setLoadingShops(false);
+      return;
+    }
+
     setLoadingShops(true);
     try {
       const res = await fetch('./api/shops');
@@ -184,26 +205,28 @@ export default function App() {
 
     async function loadShop(slug: string, encodedPayload: string | null) {
       // 1. Try backend API when hosted on Node/Express
-      try {
-        const res = await fetch(`./api/shops/${encodeURIComponent(slug)}`);
-        if (res.ok && isJsonResponse(res)) {
-          const data = (await res.json()) as { shop: ShopRecord };
-          if (!cancelled) {
-            setCustomerShop(data.shop);
-            setCustomerLoading(false);
+      if (!isStaticPagesHost()) {
+        try {
+          const res = await fetch(`./api/shops/${encodeURIComponent(slug)}`);
+          if (res.ok && isJsonResponse(res)) {
+            const data = (await res.json()) as { shop: ShopRecord };
+            if (!cancelled) {
+              setCustomerShop(data.shop);
+              setCustomerLoading(false);
+            }
+            if (trackedTapRef.current !== slug) {
+              trackedTapRef.current = slug;
+              fetch(`./api/shops/${encodeURIComponent(slug)}/events`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ type: 'tap' }),
+              }).catch(() => {});
+            }
+            return;
           }
-          if (trackedTapRef.current !== slug) {
-            trackedTapRef.current = slug;
-            fetch(`./api/shops/${encodeURIComponent(slug)}/events`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ type: 'tap' }),
-            }).catch(() => {});
-          }
-          return;
+        } catch {
+          // Static GitHub Pages fallback below
         }
-      } catch {
-        // Static GitHub Pages fallback below
       }
 
       // 2. Check encoded URL payload (?d=...) for cross-device static links
